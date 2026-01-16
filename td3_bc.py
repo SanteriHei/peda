@@ -1,12 +1,12 @@
 # source: https://github.com/sfujim/TD3_BC
 # https://arxiv.org/pdf/2106.06860.pdf
 import copy
-import time
-import pprint
 import os
 import pathlib
 import pickle
+import pprint
 import random
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -22,6 +22,7 @@ import torch.nn.functional as F
 import wandb
 
 import environments  # import to register environments for multi-objective
+from modt.utils import compute_hypervolume, compute_sparsity, pref_grid
 from state_norm_params import state_norm_params
 
 TensorBatch = List[torch.Tensor]
@@ -83,6 +84,7 @@ class TrainConfig:
     # maximum episode length
     max_ep_len: int = 500
 
+    granularity: int = 50
     # path for checkpoints saving, optional
     checkpoints_path: Optional[str] = None
     # file name for loading a model, optional
@@ -120,8 +122,6 @@ def compute_mean_std(
             (state_mean, np.ones(config.concat_state_pref * pref_dim))
         )
 
-    # mean = states.mean(0)
-    # std = states.std(0) + eps
     return state_mean, state_std
 
 
@@ -264,19 +264,31 @@ def eval_mo_actor(
     seed: int,
     preferences: torch.Tensor,
 ) -> None:
-    env.seed(seed)
     actor.eval()
-    episode_rewards = []
+
+    all_rewards = []
     for _ in range(num_episodes):
-        state, done = env.reset(), False
-        ep_reward = np.zeros((2,))
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            ep_reward += reward
-        episode_rewards.append(episode_rewards)
+        rewards = np.zeros(len(preferences))
+        for i, pref in enumerate(preferences):
+            seed = np.random.randint(0, 10000)
+            env.seed(seed)
+            state, done = env.reset(), False
+            ep_reward = 0.0
+            while not done:
+                action = actor.act(state, pref, device)
+                state, reward, done, _ = env.step(action)
+                ep_reward += pref * reward
+            rewards[i] = ep_reward
+        all_rewards.append(rewards)
     actor.train()
-    return np.stack(episode_rewards, axis=0)
+
+    # Compute average hypervolume & sparsity
+    hvs = []
+    sps = []
+    for rewards in all_rewards:
+        hvs.append(compute_hypervolume(rewards))
+        sps.append(compute_sparsity())
+    return {"hypervolume": np.mean(hvs), "sparsity": np.mean(sps)}
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -664,6 +676,8 @@ def train(config: TrainConfig):
 
     wandb_init(asdict(config))
 
+    eval_prefs = pref_grid(pref_dim, granularity=config.granularity)
+
     evaluations = []
 
     _start_time = time.perf_counter()
@@ -683,6 +697,7 @@ def train(config: TrainConfig):
                 device=config.device,
                 num_episodes=config.num_episodes,
                 seed=config.seed,
+                preferences=eval_prefs,
             )
             eval_score = eval_scores.mean()
             normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
