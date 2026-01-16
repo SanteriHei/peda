@@ -22,7 +22,12 @@ import torch.nn.functional as F
 import wandb
 
 import environments  # import to register environments for multi-objective
-from modt.utils import compute_hypervolume, compute_sparsity, pref_grid
+from modt.utils import (
+    compute_hypervolume,
+    compute_sparsity,
+    pref_grid,
+    undominated_indices,
+)
 from state_norm_params import state_norm_params
 
 TensorBatch = List[torch.Tensor]
@@ -36,6 +41,8 @@ class TrainConfig:
     group: str = "TD3_BC-D4RL"
     # wandb run name
     name: str = "TD3_BC"
+    # wandb mode
+    mode: str = "disabled"
     # training dataset and evaluation environment
     env: Literal[
         "MO-Ant-v2",
@@ -244,13 +251,20 @@ def set_seed(
 
 
 def wandb_init(config: dict) -> None:
+    cfg = {
+        key: val
+        for key, val in config.items()
+        if key not in ["project", "group", "name", "mode"]
+    }
+
     wandb.init(
         config=config,
         project=config["project"],
         group=config["group"],
         name=config["name"],
-        mode="disabled",
+        mode=config["mode"],
         id=str(uuid.uuid4()),
+        config=cfg
     )
     wandb.run.save()
 
@@ -268,17 +282,18 @@ def eval_mo_actor(
 
     all_rewards = []
     for _ in range(num_episodes):
-        rewards = np.zeros(len(preferences))
+        rewards = []
         for i, pref in enumerate(preferences):
             seed = np.random.randint(0, 10000)
             env.seed(seed)
             state, done = env.reset(), False
-            ep_reward = 0.0
+            ep_reward = np.zeros(env.obj_dim)
             while not done:
                 action = actor.act(state, pref, device)
-                state, reward, done, _ = env.step(action)
-                ep_reward += pref * reward
-            rewards[i] = ep_reward
+                state, _, done, info = env.step(action)
+                reward = info["obj"]
+                ep_reward += reward
+            rewards.append(ep_reward)
         all_rewards.append(rewards)
     actor.train()
 
@@ -287,7 +302,11 @@ def eval_mo_actor(
     sps = []
     for rewards in all_rewards:
         hvs.append(compute_hypervolume(rewards))
-        sps.append(compute_sparsity())
+
+        # indices_wanted_strict = undominated_indices(rewards, tolerance=0)
+        # print(indices_wanted_strict)
+        # front_return_batch = rewards[indices_wanted_strict]
+        sps.append(compute_sparsity(rewards))
     return {"hypervolume": np.mean(hvs), "sparsity": np.mean(sps)}
 
 
@@ -340,9 +359,9 @@ class Actor(nn.Module):
     def act(
         self, state: npt.NDArray, pref: npt.NDArray, device: str = "cpu"
     ) -> np.ndarray:
-        state = np.concatenate([state, pref], axis=1)
         state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
-        return self(state).cpu().data.numpy().flatten()
+        pref = torch.tensor(pref.reshape(1, -1), device=device, dtype=torch.float32)
+        return self(state, pref).cpu().data.numpy().flatten()
 
 
 class Critic(nn.Module):
@@ -685,13 +704,13 @@ def train(config: TrainConfig):
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
-        pprint.pprint(log_dict, indent=4)
+        # pprint.pprint(log_dict, indent=4)
         wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             _dur = time.perf_counter() - _start_time
             print(f"Time steps: {t + 1}: {config.eval_freq} steps took {_dur:.2f}s")
-            eval_scores = eval_mo_actor(
+            eval_data = eval_mo_actor(
                 env,
                 actor,
                 device=config.device,
@@ -699,13 +718,12 @@ def train(config: TrainConfig):
                 seed=config.seed,
                 preferences=eval_prefs,
             )
-            eval_score = eval_scores.mean()
-            normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
-            evaluations.append(normalized_eval_score)
+            evaluations.append(eval_data)
+
             print("---------------------------------------")
             print(
                 f"Evaluation over {config.num_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+                f"HV {eval_data['hypervolume']:.3f} , Sparsity : {eval_data['sparsity']:.3f}"
             )
             print("---------------------------------------")
 
@@ -716,9 +734,10 @@ def train(config: TrainConfig):
                 )
 
             wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score},
+                {f"eval/{key}": val for key, val in eval_data.items()},
                 step=trainer.total_it,
             )
+
             _start_time = time.perf_counter()
 
 
