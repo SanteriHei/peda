@@ -1,12 +1,14 @@
 # source: https://github.com/sfujim/TD3_BC
 # https://arxiv.org/pdf/2106.06860.pdf
 import copy
+import time
+import pprint
 import os
 import pathlib
 import pickle
 import random
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -19,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 
+import environments  # import to register environments for multi-objective
 from state_norm_params import state_norm_params
 
 TensorBatch = List[torch.Tensor]
@@ -76,7 +79,7 @@ class TrainConfig:
     # evaluation frequency, will evaluate every eval_freq training steps
     eval_freq: int = int(5e3)
     # number of episodes to run during evaluation
-    n_episodes: int = 10
+    num_episodes: int = 10
     # maximum episode length
     max_ep_len: int = 500
 
@@ -196,9 +199,8 @@ class ReplayBuffer:
         self._states[:n_transitions] = self._to_tensor(data["observations"])
         self._actions[:n_transitions] = self._to_tensor(data["actions"])
         self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        # self._preferences[:n_transitions] = self._to_tensor(
-        #     data["preferences"][..., None]
-        # )
+
+        self._preferences[:n_transitions] = self._to_tensor(data["preferences"])
         self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
         self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
         self._size += n_transitions
@@ -206,14 +208,21 @@ class ReplayBuffer:
 
         print(f"Dataset size: {n_transitions}")
 
-    def sample(self, batch_size: int) -> TensorBatch:
+    def sample(self, batch_size: int, resample_prefs: bool = False) -> TensorBatch:
         indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
         states = self._states[indices]
         actions = self._actions[indices]
-        rewards = self._rewards[indices]
+
+        if resample_prefs:
+            prefs = None  # TODO: sample from a dirichlet
+            # TODO: Compute the scalarized returns by using the just sampled prefs
+            rewards = self._rewards[indices]
+        else:
+            prefs = self._preferences[indices]
+            rewards = self._rewards[indices]
         next_states = self._next_states[indices]
         dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
+        return [states, actions, rewards, next_states, prefs, dones]
 
     def add_transition(self):
         # Use this method to add new data into the replay buffer during fine-tuning.
@@ -240,6 +249,7 @@ def wandb_init(config: dict) -> None:
         project=config["project"],
         group=config["group"],
         name=config["name"],
+        mode="disabled",
         id=str(uuid.uuid4()),
     )
     wandb.run.save()
@@ -294,11 +304,13 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, max_action: float):
+    def __init__(
+        self, state_dim: int, action_dim: int, pref_dim: int, max_action: float
+    ):
         super(Actor, self).__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(state_dim + pref_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
@@ -308,30 +320,36 @@ class Actor(nn.Module):
 
         self.max_action = max_action
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.max_action * self.net(state)
+    def forward(self, state: torch.Tensor, pref: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([state, pref], dim=1)
+        return self.max_action * self.net(x)
 
     @torch.no_grad()
-    def act(self, state: np.ndarray, device: str = "cpu") -> np.ndarray:
+    def act(
+        self, state: npt.NDArray, pref: npt.NDArray, device: str = "cpu"
+    ) -> np.ndarray:
+        state = np.concatenate([state, pref], axis=1)
         state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
         return self(state).cpu().data.numpy().flatten()
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, pref_dim: int):
         super(Critic, self).__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
+            nn.Linear(state_dim + action_dim + pref_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
             nn.Linear(256, 1),
         )
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        sa = torch.cat([state, action], 1)
-        return self.net(sa)
+    def forward(
+        self, state: torch.Tensor, action: torch.Tensor, pref: torch.Tensor
+    ) -> torch.Tensor:
+        saw = torch.cat([state, action, pref], 1)
+        return self.net(saw)
 
 
 class TD3_BC:
@@ -377,7 +395,7 @@ class TD3_BC:
         log_dict = {}
         self.total_it += 1
 
-        state, action, reward, next_state, done = batch
+        state, action, reward, next_state, pref, done = batch
         not_done = 1 - done
 
         with torch.no_grad():
@@ -386,19 +404,21 @@ class TD3_BC:
                 -self.noise_clip, self.noise_clip
             )
 
-            next_action = (self.actor_target(next_state) + noise).clamp(
+            next_action = (self.actor_target(next_state, pref) + noise).clamp(
                 -self.max_action, self.max_action
             )
 
             # Compute the target Q value
-            target_q1 = self.critic_1_target(next_state, next_action)
-            target_q2 = self.critic_2_target(next_state, next_action)
+            target_q1 = self.critic_1_target(next_state, next_action, pref)
+            target_q2 = self.critic_2_target(next_state, next_action, pref)
             target_q = torch.min(target_q1, target_q2)
-            target_q = reward + not_done * self.discount * target_q
+            target_q = (
+                reward + not_done * self.discount * target_q
+            )  # NOTE: Uses scalarized reward!
 
         # Get current Q estimates
-        current_q1 = self.critic_1(state, action)
-        current_q2 = self.critic_2(state, action)
+        current_q1 = self.critic_1(state, action, pref)
+        current_q2 = self.critic_2(state, action, pref)
 
         # Compute critic loss
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
@@ -415,8 +435,8 @@ class TD3_BC:
         # Delayed actor updates
         if self.total_it % self.policy_freq == 0:
             # Compute actor loss
-            pi = self.actor(state)
-            q = self.critic_1(state, pi)
+            pi = self.actor(state, pref)
+            q = self.critic_1(state, pi, pref)
             lmbda = self.alpha / q.abs().mean().detach()
 
             actor_loss = -lmbda * q.mean() + F.mse_loss(pi, action)
@@ -461,7 +481,7 @@ class TD3_BC:
 
 
 def load_dataset(config: TrainConfig):
-    """Loads & preprocesses the trajectory dataset"""
+    """Loads & preprocesses the offline trajectory dataset"""
     dataset_paths = [
         pathlib.Path(config.data_path)
         / config.env
@@ -518,18 +538,18 @@ def load_dataset(config: TrainConfig):
         terminals.append(traj["terminals"])
         rewards.append(traj["rewards"])
         mo_rewards.append(traj["raw_rewards"])
-        preferences.append(traj["preference"][0, :])
+        # TODO: Could just add one preference, as these are the same for the whole trajectory
+        preferences.append(traj["preference"])
 
         # Some extra stuff that is not maybe needed?
         traj_lens.append(len(traj["observations"]))
         returns.append(traj["rewards"].sum())
         returns_mo.append(traj["raw_rewards"].sum(axis=0))
 
-    traj_lens, returns, returns_mo, preferences = (
+    traj_lens, returns, returns_mo = (
         np.array(traj_lens),
         np.array(returns),
         np.array(returns_mo),
-        np.array(preferences),
     )
 
     obs = np.concatenate(obs, axis=0)
@@ -538,6 +558,7 @@ def load_dataset(config: TrainConfig):
     rewards = np.concatenate(rewards, axis=0)
     mo_rewards = np.concatenate(mo_rewards, axis=0)
     terminals = np.concatenate(terminals, axis=0)
+    preferences = np.concatenate(preferences, axis=0)
 
     out = {
         "observations": obs,
@@ -548,24 +569,22 @@ def load_dataset(config: TrainConfig):
         "preferences": preferences,
         "terminals": terminals,
     }
-    # for key,val in out.items():
-    #     print(f"{key} -> {val.shape}")
     return out
 
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = None  # gym.make(config.env)
+    env = gym.make(config.env)
 
-    state_dim = 11  # env.observation_space.shape[0]
-    action_dim = 3  # env.action_space.shape[0]
-    # reward_size = env.obj_dim
-    pref_dim = 2  # reward_size
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    pref_dim = env.obj_dim
     scale = 100
 
     state_dim += pref_dim * config.concat_state_pref
     if not config.normalize_reward:
         scale *= 10
+
     dataset = load_dataset(config)
 
     if config.normalize_states:
@@ -604,12 +623,12 @@ def train(config: TrainConfig):
     seed = config.seed
     set_seed(seed, env)
 
-    actor = Actor(state_dim, action_dim, max_action).to(config.device)
+    actor = Actor(state_dim, action_dim, pref_dim, max_action).to(config.device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
 
-    critic_1 = Critic(state_dim, action_dim).to(config.device)
+    critic_1 = Critic(state_dim, action_dim, pref_dim).to(config.device)
     critic_1_optimizer = torch.optim.Adam(critic_1.parameters(), lr=3e-4)
-    critic_2 = Critic(state_dim, action_dim).to(config.device)
+    critic_2 = Critic(state_dim, action_dim, pref_dim).to(config.device)
     critic_2_optimizer = torch.optim.Adam(critic_2.parameters(), lr=3e-4)
 
     kwargs = {
@@ -643,22 +662,26 @@ def train(config: TrainConfig):
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
 
-    # wandb_init(asdict(config))
+    wandb_init(asdict(config))
 
     evaluations = []
+
+    _start_time = time.perf_counter()
     for t in range(int(config.max_timesteps)):
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
+        pprint.pprint(log_dict, indent=4)
         wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
+            _dur = time.perf_counter() - _start_time
+            print(f"Time steps: {t + 1}: {config.eval_freq} steps took {_dur:.2f}s")
             eval_scores = eval_mo_actor(
                 env,
                 actor,
                 device=config.device,
-                n_episodes=config.n_episodes,
+                num_episodes=config.num_episodes,
                 seed=config.seed,
             )
             eval_score = eval_scores.mean()
@@ -666,7 +689,7 @@ def train(config: TrainConfig):
             evaluations.append(normalized_eval_score)
             print("---------------------------------------")
             print(
-                f"Evaluation over {config.n_episodes} episodes: "
+                f"Evaluation over {config.num_episodes} episodes: "
                 f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
             )
             print("---------------------------------------")
@@ -681,6 +704,7 @@ def train(config: TrainConfig):
                 {"d4rl_normalized_score": normalized_eval_score},
                 step=trainer.total_it,
             )
+            _start_time = time.perf_counter()
 
 
 if __name__ == "__main__":
