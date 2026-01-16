@@ -1,0 +1,28 @@
+name: peda
+channels:
+  - conda-forge
+  - pytorch
+
+dependencies:
+  - python=3.10
+  - absl-py=1.2.0
+  - numpy
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - pandas
+  - python-lsp-server
+  - python-lsp-ruff
+  - ipython
+  - gdown
+  - pip<=24.1
+  - wandb
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - pyrallis==0.3.1
+    - torch==2.8.0+cu128
+    - torchvision==0.24.0+cu128
+    - mujoco==2.2.1
+    - mujoco-py==2.1.2.14
+    - gym==0.21.0
+    
