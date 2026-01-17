@@ -43,19 +43,13 @@ class TrainConfig:
     name: str = "TD3_BC"
     # wandb mode
     mode: str = "disabled"
-    # training dataset and evaluation environment
-    env: Literal[
-        "MO-Ant-v2",
-        "MO-HalfCheetah-v2",
-        "MO-Hopper-v2",
-        "MO-Hopper-v3",
-        "MO-Walker2d-v2",
-    ] = "MO-Hopper-v2"
+    # Environment name. One of {MO-Ant-v2, MO-HalfCheetah-v2, MO-Hopper-v2, MO-Hopper-v3, MO-Walker2d-v2 }
+    env: str = "MO-Hopper-v2"
+    # The used dataset One of {amateur_uniform, amateur_narrow, expert_uniform, expert_narrow}
+    dataset: str = "expert_uniform" 
+    
+    # Path to the directory that contains the dataset
     data_path: pathlib.Path = pathlib.Path(__file__).parents[0] / "data"
-    dataset: Literal[
-        "amateur_uniform", "amateur_narrow", "expert_uniform", "expert_narrow"
-    ] = "expert_uniform"
-
     # Determine if the preferences are concatenated to the observations
     concat_state_pref: int = 0
 
@@ -258,7 +252,6 @@ def wandb_init(config: dict) -> None:
     }
 
     wandb.init(
-        config=config,
         project=config["project"],
         group=config["group"],
         name=config["name"],
@@ -266,7 +259,6 @@ def wandb_init(config: dict) -> None:
         id=str(uuid.uuid4()),
         config=cfg
     )
-    wandb.run.save()
 
 
 @torch.no_grad()
