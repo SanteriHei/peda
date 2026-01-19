@@ -46,7 +46,7 @@ def undominated_indices(obj_batch_input, tolerance=0):
             obj_batch, obj_batch[idx], tolerance
         ):
             indices.append(idx)
-    return indices
+    return np.asarray(indices)
 
 
 def _is_close_to_one(x):

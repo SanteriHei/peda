@@ -338,9 +338,14 @@ def eval_mo_actor(
         hvs.append(compute_hypervolume(rewards))
 
         indices_wanted_strict = undominated_indices(rewards, tolerance=0)
-        print(indices_wanted_strict)
-        front_return_batch = rewards[indices_wanted_strict]
-        sps.append(compute_sparsity(rewards))
+        indices_wanted_strict = np.asanyarray(indices_wanted_strict)
+        if len(indices_wanted_strict) == 0:
+            print("Front contained no non-dominated inds!")
+            front_return_batch = []
+        else:
+            print(f"Front contained {len(indices_wanted_strict)} non-dominated inds!")
+            front_return_batch = rewards[indices_wanted_strict]
+        sps.append(compute_sparsity(front_return_batch))
     return {"hypervolume": np.mean(hvs), "sparsity": np.mean(sps)}
 
 
@@ -1114,6 +1119,7 @@ def train(config: TrainConfig):
 
     # Set seeds
     seed = config.seed
+    print(f"Config seed {seed}")
     set_seed(seed, env)
 
     critic_1 = FullyConnectedQFunction(
