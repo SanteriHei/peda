@@ -2,16 +2,15 @@
 # https://arxiv.org/pdf/2106.06860.pdf
 import copy
 import os
-from datetime import datetime
 import pathlib
 import pickle
-import pprint
 import random
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import gym
 import numpy as np
@@ -23,7 +22,6 @@ import torch.nn.functional as F
 import wandb
 
 import environments  # import to register environments for multi-objective
-
 
 # imports from modt
 from modt.utils import (
@@ -50,8 +48,8 @@ class TrainConfig:
     # Environment name. One of {MO-Ant-v2, MO-HalfCheetah-v2, MO-Hopper-v2, MO-Hopper-v3, MO-Walker2d-v2 }
     env: str = "MO-Hopper-v2"
     # The used dataset One of {amateur_uniform, amateur_narrow, expert_uniform, expert_narrow}
-    dataset: str = "expert_uniform" 
-    
+    dataset: str = "expert_uniform"
+
     # Path to the directory that contains the dataset
     data_path: pathlib.Path = pathlib.Path(__file__).parents[0] / "data"
     # Determine if the preferences are concatenated to the observations
@@ -88,7 +86,7 @@ class TrainConfig:
     num_episodes: int = 10
     # maximum episode length
     max_ep_len: int = 500
-
+    # Determoines the number of points used for evaluation
     granularity: int = 50
     # path for checkpoints saving, optional
     checkpoints_path: Optional[str] = None
@@ -100,7 +98,6 @@ class TrainConfig:
     device: str = "cuda"
 
     def __post_init__(self):
-
         if len(self.name) == 0:
             self.name = f"td3_bc-{self.env}-{str(uuid.uuid4())[:8]}"
 
@@ -262,7 +259,7 @@ def wandb_init(config: dict) -> None:
         for key, val in config.items()
         if key not in ["project", "group", "name", "mode"]
     }
-        
+
     env_dataset = f"{config['env'].lower()}-{config['dataset']}"
     tags = ["td3_bc", config["env"].lower(), config["dataset"], env_dataset]
 
@@ -273,7 +270,7 @@ def wandb_init(config: dict) -> None:
         mode=config["mode"],
         id=str(uuid.uuid4()),
         tags=tags,
-        config=cfg
+        config=cfg,
     )
 
 
@@ -317,29 +314,6 @@ def eval_mo_actor(
         sps.append(compute_sparsity(rewards))
     return {"hypervolume": np.mean(hvs), "sparsity": np.mean(sps)}
 
-
-def return_reward_range(dataset, max_episode_steps):
-    returns, lengths = [], []
-    ep_ret, ep_len = 0.0, 0
-    for r, d in zip(dataset["rewards"], dataset["terminals"]):
-        ep_ret += float(r)
-        ep_len += 1
-        if d or ep_len == max_episode_steps:
-            returns.append(ep_ret)
-            lengths.append(ep_len)
-            ep_ret, ep_len = 0.0, 0
-    lengths.append(ep_len)  # but still keep track of number of steps
-    assert sum(lengths) == len(dataset["rewards"])
-    return min(returns), max(returns)
-
-
-# def modify_reward(dataset, env_name, max_episode_steps=1000):
-#     if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-#         min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-#         dataset["rewards"] /= max_ret - min_ret
-#         dataset["rewards"] *= max_episode_steps
-#     elif "antmaze" in env_name:
-#         dataset["rewards"] -= 1.0
 
 
 class Actor(nn.Module):
@@ -530,7 +504,7 @@ def load_dataset(config: TrainConfig):
     for data_path in dataset_paths:
         with open(data_path, "rb") as f:
             trajectories.extend(pickle.load(f))
-    
+
     total_shape = sum(traj["observations"].shape[0] for traj in trajectories)
     print(f"{total_shape=}")
     obs, actions, next_obs, rewards, mo_rewards, preferences, terminals = (
@@ -620,12 +594,7 @@ def train(config: TrainConfig):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     pref_dim = env.obj_dim
-    #scale = 100
-
     state_dim += pref_dim * config.concat_state_pref
-    # if not config.normalize_reward:
-    #     scale *= 10
-
     dataset = load_dataset(config)
 
     if config.normalize_states:
@@ -718,11 +687,11 @@ def train(config: TrainConfig):
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             _dur = time.perf_counter() - _start_time
-            _prop = (t+1)/int(config.max_timesteps)
+            _prop = (t + 1) / int(config.max_timesteps)
             print(
-                    f"Timesteps: {t + 1}/{config.max_timesteps} "
-                    f"({100*_prop:.2f}%): {config.eval_freq} steps took "
-                    f"{_dur:.2f}s"
+                f"Timesteps: {t + 1}/{config.max_timesteps} "
+                f"({100 * _prop:.2f}%): {config.eval_freq} steps took "
+                f"{_dur:.2f}s"
             )
             eval_data = eval_mo_actor(
                 env,
