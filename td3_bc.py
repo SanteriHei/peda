@@ -2,6 +2,7 @@
 # https://arxiv.org/pdf/2106.06860.pdf
 import copy
 import os
+from datetime import datetime
 import pathlib
 import pickle
 import pprint
@@ -41,9 +42,9 @@ class TrainConfig:
     # wandb project name
     project: str = "CORL"
     # wandb group name
-    group: str = "TD3_BC-D4RL"
+    group: str = ""
     # wandb run name
-    name: str = "TD3_BC"
+    name: str = ""
     # wandb mode
     mode: str = "disabled"
     # Environment name. One of {MO-Ant-v2, MO-HalfCheetah-v2, MO-Hopper-v2, MO-Hopper-v3, MO-Walker2d-v2 }
@@ -99,9 +100,17 @@ class TrainConfig:
     device: str = "cuda"
 
     def __post_init__(self):
-        self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
+
+        if len(self.name) == 0:
+            self.name = f"td3_bc-{self.env}-{str(uuid.uuid4())[:8]}"
+
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
+
+        today = datetime.now().strftime("%d-%m-%Y")
+        # Setup group name automatically
+        if len(self.group) == 0:
+            self.group = f"td_bc3-{self.env.lower()}-{today}"
 
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
@@ -253,6 +262,9 @@ def wandb_init(config: dict) -> None:
         for key, val in config.items()
         if key not in ["project", "group", "name", "mode"]
     }
+        
+    env_dataset = f"{config['env'].lower()}-{config['dataset']}"
+    tags = ["td3_bc", config["env"].lower(), config["dataset"], env_dataset]
 
     wandb.init(
         project=config["project"],
@@ -260,6 +272,7 @@ def wandb_init(config: dict) -> None:
         name=config["name"],
         mode=config["mode"],
         id=str(uuid.uuid4()),
+        tags=tags,
         config=cfg
     )
 
@@ -320,13 +333,13 @@ def return_reward_range(dataset, max_episode_steps):
     return min(returns), max(returns)
 
 
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-        min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-        dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
-    elif "antmaze" in env_name:
-        dataset["rewards"] -= 1.0
+# def modify_reward(dataset, env_name, max_episode_steps=1000):
+#     if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
+#         min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
+#         dataset["rewards"] /= max_ret - min_ret
+#         dataset["rewards"] *= max_episode_steps
+#     elif "antmaze" in env_name:
+#         dataset["rewards"] -= 1.0
 
 
 class Actor(nn.Module):
@@ -517,7 +530,9 @@ def load_dataset(config: TrainConfig):
     for data_path in dataset_paths:
         with open(data_path, "rb") as f:
             trajectories.extend(pickle.load(f))
-
+    
+    total_shape = sum(traj["observations"].shape[0] for traj in trajectories)
+    print(f"{total_shape=}")
     obs, actions, next_obs, rewards, mo_rewards, preferences, terminals = (
         [],
         [],
@@ -605,11 +620,11 @@ def train(config: TrainConfig):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     pref_dim = env.obj_dim
-    scale = 100
+    #scale = 100
 
     state_dim += pref_dim * config.concat_state_pref
-    if not config.normalize_reward:
-        scale *= 10
+    # if not config.normalize_reward:
+    #     scale *= 10
 
     dataset = load_dataset(config)
 
@@ -699,12 +714,16 @@ def train(config: TrainConfig):
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
-        # pprint.pprint(log_dict, indent=4)
         wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             _dur = time.perf_counter() - _start_time
-            print(f"Time steps: {t + 1}: {config.eval_freq} steps took {_dur:.2f}s")
+            _prop = (t+1)/int(config.max_timesteps)
+            print(
+                    f"Timesteps: {t + 1}/{config.max_timesteps} "
+                    f"({100*_prop:.2f}%): {config.eval_freq} steps took "
+                    f"{_dur:.2f}s"
+            )
             eval_data = eval_mo_actor(
                 env,
                 actor,
